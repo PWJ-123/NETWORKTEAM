@@ -77,7 +77,7 @@ const char* get_mime_type(const char* file_path) {
 }
 
 
-// --- 2. HTTP 요청 파서 함수 (담당자 2의 결과물) ---
+// --- 2. HTTP 요청 파서 함수 ---
 
 /**
  * 소켓으로부터 받은 raw HTTP 요청을 파싱하여 HttpRequest 구조체를 채웁니다.
@@ -253,7 +253,7 @@ int main(void) {
 
     while (1) {
         printf("\n[DEBUG] 새로운 클라이언트 연결 대기 중...\n");
-        client_sock = accept(server_sock, NULL, NULL); // 담당자 1의 결과물 사용
+        client_sock = accept(server_sock, NULL, NULL); 
 
         if (client_sock == INVALID_SOCKET) continue;
 
@@ -269,7 +269,7 @@ int main(void) {
 
         request_raw[str_len] = '\0'; // 수신된 데이터의 끝에 NULL 종단 문자 추가
 
-        // ★★★ (담당자 5: 로깅) 수신된 HTTP 요청 내용 로그 출력 ★★★
+        // ★★★수신된 HTTP 요청 내용 로그 출력 ★★★
         printf("----------------------------------------\n");
         printf("[RAW REQUEST]\n%s", request_raw);
 
@@ -283,7 +283,7 @@ int main(void) {
         memset(&response, 0, sizeof(HttpResponse));
         handle_request(&request, &response); 
 
-        // --- 담당자 4 영역: 응답 생성 및 전송 ---
+        // --- 응답 생성 및 전송 ---
         char header[512];
 
         // 응답 헤더 생성
