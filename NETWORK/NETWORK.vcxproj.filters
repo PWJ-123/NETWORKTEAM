@@ -21,5 +21,11 @@
     <ClCompile Include="server_windows.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="2025_11_14.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="12.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

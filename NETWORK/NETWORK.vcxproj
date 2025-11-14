@@ -123,8 +123,10 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="12.cpp" />
     <ClCompile Include="GitTest.c" />
     <ClCompile Include="server_windows.c" />
+    <ClCompile Include="2025_11_14.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
