@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8"> <script>
+        // C++ 클라이언트와 통신하기 위한 헬퍼 함수
+        
+        // 1. GET 요청용 함수
+        function sendGet(uri) {
+            // C++에게 "GET:/uri" 형태의 메시지 전송
+            window.chrome.webview.postMessage("GET:" + uri);
+        }
+
+        // 2. POST 요청용 함수 (Form 태그용)
+        function sendPost(event, uri) {
+            event.preventDefault(); // 브라우저가 직접 이동하려는 것을 막음 (필수!)
+
+            var form = event.target;
+            var formData = new FormData(form);
+            
+            // 폼 데이터를 "key=value&key2=value2" 형태로 변환
+            var params = new URLSearchParams(formData);
+            var queryString = params.toString();
+
+            // C++에게 "POST:/uri:데이터" 형태의 메시지 전송
+            window.chrome.webview.postMessage("POST:" + uri + ":" + queryString);
+        }
+    </script>
+</head>
+<body>
+    <h1>Winsock Web Client</h1>
+
+    <button type="button" onclick="sendGet('/page2.html')">
+        페이지 2로 이동 (GET)
+    </button>
+    
+    <hr>
+
+    <form onsubmit="sendPost(event, '/login')">
+        ID: <input type="text" name="id"><br>
+        PW: <input type="password" name="pw"><br>
+        <button type="submit">로그인 (POST)</button>
+    </form>
+</body>
+</html>
