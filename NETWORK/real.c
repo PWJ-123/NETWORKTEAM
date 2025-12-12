@@ -5,6 +5,8 @@
 #include <string.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <process.h>    // _beginthreadex, _endthreadex
+#include <windows.h>    // GetCurrentThreadId, HANDLE
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -30,6 +32,18 @@ typedef struct {
     char* content;// 응답 본문 데이터 (동적 할당된 메모리 포인터)
     long content_size;// 응답 본문의 크기
 } HttpResponse;
+
+typedef struct {
+    SOCKET client_sock;
+} ThreadArgs;
+
+
+void error_handling(const char* message);
+char* read_file(const char* path, long* out_size);
+const char* get_mime_type(const char* file_path);
+void parse_request(const char* request_raw, HttpRequest* req);
+void handle_request(const HttpRequest* req, HttpResponse* res);
+unsigned __stdcall handle_client(void* arg_ptr); // 담당자 5: 스레드 함수
 
 // --- 유틸리티 함수 (공통) ---
 
@@ -139,19 +153,42 @@ void parse_request(const char* request_raw, HttpRequest* req) {
             req->body = (char*)(body_start + 4); // "\r\n\r\n" 건너뛰기
         }
         else {
-            req->body = NULL;
+            req->body = (char*)(body_start + 4);
         }
     }
+}
+void handle_request(const HttpRequest* req, HttpResponse* res) {
+    char full_path[512];
+
+    // URI가 '/'만 있을 경우 index.html로 처리
+    if (strcmp(req->uri, "/") == 0) {
+        sprintf(full_path, "%s\\index.html", WEB_ROOT);
+    }
     else {
-        req->body = NULL;
+        // WEB_ROOT + URI 결합 (Windows 경로)
+        sprintf(full_path, "%s%s", WEB_ROOT, req->uri);
+        // 슬래시를 백슬래시로 변환 (Windows 파일 시스템)
+        for (char* p = full_path; *p; p++) {
+            if (*p == '/') *p = '\\';
+        }
     }
 
-    printf("[PARSER] 메서드: %s, URI: %s\n", req->method, req->uri);
-    if (req->query_string[0] != '\0') {
-        printf("[PARSER] 쿼리 스트링 (GET 파라미터): %s\n", req->query_string);
+    long content_size = 0;
+    char* content = read_file(full_path, &content_size);
+
+    if (content) {
+        res->status_code = 200;
+        res->status_text = "OK";
+        res->mime_type = get_mime_type(full_path);
+        res->content = content;
+        res->content_size = content_size;
     }
-    if (req->body) {
-        printf("[PARSER] POST 본문 데이터 감지: %s\n", req->body);
+    else {
+        res->status_code = 404;
+        res->status_text = "Not Found";
+        res->mime_type = "text/html";
+        res->content = "<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1><p>Requested resource not found.</p></body></html>";
+        res->content_size = strlen(res->content);
     }
 }
 
@@ -162,110 +199,69 @@ void parse_request(const char* request_raw, HttpRequest* req) {
  * HttpRequest를 분석하여 적절한 HttpResponse를 생성
  * 
  */
-void handle_request(const HttpRequest* req, HttpResponse* res) {
+ */
+unsigned __stdcall handle_client(void* arg_ptr) {
+    ThreadArgs* args = (ThreadArgs*)arg_ptr;
+    SOCKET client_sock = args->client_sock;
+    free(arg_ptr);
 
-    // 1. POST 요청 처리 (동적 처리 시뮬레이션)
-    if (strcmp(req->method, "POST") == 0) {
+    char request_raw[MAX_REQ_SIZE];
+    int str_len = recv(client_sock, request_raw, sizeof(request_raw) - 1, 0);
 
-        // 동적 응답 본문을 위한 메모리 할당 (최대 1024바이트로 가정)
-        char* response_buffer = (char*)malloc(1024);
-        if (response_buffer) {
-            sprintf(response_buffer,
-                "<html><body><h1>[POST 처리] 데이터 수신 성공</h1>"
-                "<p>요청 경로: <b>%s</b></p>"
-                "<p>수신 데이터: <pre>%s</pre></p>"
-                "<p>POST 요청은 정적 파일 서버에서 처리되지 않고 동적 서버로 전달됩니다.</p>"
-                "</body></html>",
-                req->uri, req->body ? req->body : "데이터 없음");
-
-            res->status_code = 200;
-            res->status_text = "OK";
-            res->mime_type = "text/html";
-            res->content = response_buffer;
-            res->content_size = strlen(response_buffer);
-        }
-        else {
-            // 메모리 할당 실패 (500)
-            res->status_code = 500;
-            res->status_text = "Internal Server Error";
-            res->mime_type = "text/html";
-            res->content = "<html><body><h1>500 Internal Server Error</h1></body></html>";
-            res->content_size = strlen(res->content);
-        }
-        return;
+    if (str_len <= 0) {
+        printf("[LOG] 스레드 %lu: 클라이언트 연결 끊김 또는 데이터 수신 실패. 소켓 종료.\n", GetCurrentThreadId());
+        closesocket(client_sock);
+        _endthreadex(0); // 스레드 종료
+        return 0;
     }
 
-    // 2. GET 요청 처리 (정적 파일 서빙)
-    else if (strcmp(req->method, "GET") == 0) {
+    request_raw[str_len] = '\0';
 
-        char local_uri[256];
-        strcpy(local_uri, req->uri);
+    printf("-------------------- [NEW THREAD %lu] --------------------\n", GetCurrentThreadId());
+    printf("[RAW REQUEST]\n%s", request_raw);
 
-        // 루트 요청 '/'의 경우, 'index.html'로 변경
-        if (strcmp(local_uri, "/") == 0) {
-            strcpy(local_uri, "/index.html");
-        }
+    HttpRequest request;
+    memset(&request, 0, sizeof(HttpRequest));
+    parse_request(request_raw, &request);
 
-        // 로컬 파일 경로 생성 (WEB_ROOT + URI)
-        char file_path[512] = { 0, };
+    HttpResponse response;
+    memset(&response, 0, sizeof(HttpResponse));
+    handle_request(&request, &response);
 
-        // '\'를 경로 구분자로 사용하기 위해 uri의 '/'를 '\'로 변경
-        for (int i = 0; local_uri[i]; i++) {
-            if (local_uri[i] == '/') local_uri[i] = '\\';
-        }
-        sprintf(file_path, "%s%s", WEB_ROOT, local_uri);
+    char header[512];
 
-        // 파일 읽기 시도
-        char* file_content = read_file(file_path, &res->content_size);
+    sprintf(header,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s; charset=UTF-8\r\n"
+        "Content-Length: %ld\r\n"
+        "Connection: close\r\n\r\n",
+        response.status_code, response.status_text,
+        response.mime_type, response.content_size);
 
-        if (file_content) {
-            // 파일 읽기 성공 (200 OK)
-            res->status_code = 200;
-            res->status_text = "OK";
-            res->mime_type = get_mime_type(file_path);
-            res->content = file_content; // read_file에서 할당된 메모리 포인터
-            printf("[HANDLER] 파일 로드 성공: %s\n", file_path);
+    printf("-------------------- [THREAD %lu] --------------------\n", GetCurrentThreadId());
+    printf("[RESPONSE HEADER]\n%s", header);
+    printf("------------------------------------------------------\n");
 
-            // 추가: 쿼리 스트링을 HTML에 포함시켜 클라이언트에게 보여주기 (시뮬레이션)
-            if (req->query_string[0] != '\0') {
-                char* temp_content = (char*)malloc(res->content_size + 512); // 버퍼 확장
-                if (temp_content) {
-                    sprintf(temp_content, "%s<hr><p><b>[GET 파라미터 감지]</b>: %s</p>", res->content, req->query_string);
-                    free(res->content); // 이전 파일 내용 해제
-                    res->content = temp_content;
-                    res->content_size = strlen(temp_content);
-                }
-            }
+    send(client_sock, header, strlen(header), 0);
+    send(client_sock, response.content, response.content_size, 0);
+
+    printf("[LOG] 스레드 %lu: 응답 전송 완료 (%d %s). 소켓 종료.\n",
+        GetCurrentThreadId(), response.status_code, response.status_text);
 
 
-        }
-        else {
-            // 파일 읽기 실패 (404 Not Found)
-            res->status_code = 404;
-            res->status_text = "Not Found";
-            res->mime_type = "text/html";
-            // 404 응답 본문 생성 (정적 문자열)
-            res->content = "<html><body><h1>404 Not Found</h1><p>Resource not found.</p></body></html>";
-            res->content_size = strlen(res->content);
-            printf("[HANDLER] 404 Not Found: %s\n", file_path);
-        }
-        return;
+    if (response.content != NULL && response.status_code == 200) {
+        free(response.content);
     }
+    closesocket(client_sock);
 
-    // 3. 기타 메서드 처리 (501 Not Implemented)
-    res->status_code = 501;
-    res->status_text = "Not Implemented";
-    res->mime_type = "text/html";
-    res->content = "<html><body><h1>501 Not Implemented</h1></body></html>";
-    res->content_size = strlen(res->content);
-    printf("[HANDLER] 501 Not Implemented: %s\n", req->method);
+    _endthreadex(0); // 스레드 종료
+    return 0;
 }
 
 // --- main 함수 ---
 
 int main(void) {
     WSADATA wsaData;
-    SOCKET server_sock, client_sock;
     SOCKADDR_IN server_addr;
     int port = 8080;
 
@@ -286,76 +282,54 @@ int main(void) {
     if (listen(server_sock, 5) == SOCKET_ERROR)
         error_handling("listen() error");
 
+
+    printf("========================================\n");
     printf("HTTP 서버 %d 포트에서 대기 중...\n", port);
     printf("--- 파일 루트 경로: %s ---\n", WEB_ROOT);
+    printf("[LOG] 멀티스레드 동시성 모델 사용.\n");
+    printf("========================================\n");
 
     while (1) {
-        printf("\n[DEBUG] 새로운 클라이언트 연결 대기 중...\n");
+        SOCKET client_sock;
+
+        printf("\n[LOG] 메인 스레드 %lu: 새로운 클라이언트 연결 대기 중...\n", GetCurrentThreadId());
         client_sock = accept(server_sock, NULL, NULL);
 
-        if (client_sock == INVALID_SOCKET) continue;
+        if (client_sock == INVALID_SOCKET) {
+            printf("[LOG] accept() 오류 발생. 다시 대기.\n");
+            continue; // 이제 while 루프 내부에 있으므로 유효함
+        }
 
-        printf("[INFO] 클라이언트 연결 수락됨!\n");
 
-        char request_raw[MAX_REQ_SIZE];
-        int str_len = recv(client_sock, request_raw, sizeof(request_raw) - 1, 0);
 
-        if (str_len <= 0) {
+        ThreadArgs* args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
+        if (args == NULL) {
+            printf("[LOG] 메모리 할당 실패 (ThreadArgs). 연결 종료.\n");
             closesocket(client_sock);
             continue;
         }
+        args->client_sock = client_sock;
 
-        request_raw[str_len] = '\0'; // 수신된 데이터의 끝에 NULL 종단 문자 추가
+        // 새로운 스레드 생성
+        unsigned long thread_id;
+        HANDLE hThread = (HANDLE)_beginthreadex(
+            NULL,               // 보안 속성
+            0,                  // 스택 크기
+            handle_client,      // 스레드 함수 포인터
+            (void*)args,        // 스레드 함수 인자
+            0,                  // 생성 플래그
+            &thread_id          // 스레드 ID 저장 변수
+        );
 
-        // ★★★수신된 HTTP 요청 내용 로그 출력 ★★★
-        printf("----------------------------------------\n");
-        printf("[RAW REQUEST]\n%s", request_raw);
-
-        //요청 파싱 ---
-        HttpRequest request;
-        memset(&request, 0, sizeof(HttpRequest));
-        parse_request(request_raw, &request);
-
-        //요청 처리 ---
-        HttpResponse response;
-        memset(&response, 0, sizeof(HttpResponse));
-        handle_request(&request, &response);
-
-        // --- 응답 생성 및 전송 ---
-        char header[512];
-
-        // 응답 헤더 생성
-        sprintf(header,
-            "HTTP/1.1 %d %s\r\n"
-            "Content-Type: %s; charset=UTF-8\r\n"
-            "Content-Length: %ld\r\n"
-            "Connection: close\r\n\r\n",
-            response.status_code, response.status_text,
-            response.mime_type, response.content_size);
-
-        // ★★★ 생성된 헤더 내용 CMD에 출력 ★★★
-        printf("----------------------------------------\n");
-        printf("[RESPONSE HEADER]\n%s", header);
-        printf("----------------------------------------\n");
-
-        // 헤더 전송
-        send(client_sock, header, strlen(header), 0);
-
-        // 본문 전송
-        send(client_sock, response.content, response.content_size, 0);
-
-        printf("[INFO] 응답 전송 완료 (%d %s). 소켓 종료.\n", response.status_code, response.status_text);
-
-        // --- 메모리 정리 ---
-        // read_file로 할당받았거나 POST 처리에서 할당받은 메모리 해제
-        // 404/500 응답 본문은 정적 문자열이므로 해제하지 않음.
-        if (response.content != NULL) {
-            if (response.status_code == 200) {
-                free(response.content);
-            }
+        if (hThread == NULL) {
+            printf("[LOG] 스레드 생성 실패! 연결 종료.\n");
+            free(args);
+            closesocket(client_sock);
         }
-
-        closesocket(client_sock);
+        else {
+            CloseHandle(hThread);
+            printf("[LOG] 메인 스레드: 클라이언트 처리를 위한 새 스레드 %lu 생성 완료.\n", thread_id);
+        }
     }
 
     closesocket(server_sock);
