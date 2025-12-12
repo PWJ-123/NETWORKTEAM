@@ -15,24 +15,17 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="GuiHttpServer.cpp">
+    <ClCompile Include="client.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
-    <ClCompile Include="http_server.c">
+    <ClCompile Include="client2.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="resource.h">
-      <Filter>헤더 파일</Filter>
-    </ClInclude>
-    <ClInclude Include="http_server.h">
-      <Filter>헤더 파일</Filter>
-    </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <ResourceCompile Include="NETWORK.rc">
-      <Filter>리소스 파일</Filter>
-    </ResourceCompile>
+    <None Include="page2.html">
+      <Filter>소스 파일</Filter>
+    </None>
+    <None Include="packages.config" />
   </ItemGroup>
 </Project>
