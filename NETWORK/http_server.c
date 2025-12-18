@@ -18,6 +18,25 @@
 #define WEB_ROOT "C:\\GIMALWORKSPACE"
 #define MAX_REQ_SIZE 4096
 
+#define MAX_IP_TRACK     256
+#define RATE_WINDOW_MS   5000     // 5초
+#define RATE_MAX_REQ     3       // 허용 요청 수
+#define BAN_TIME_MS      10000    // 차단 시간(ms)
+
+
+
+typedef struct {
+    char  ip[32];
+    int   request_count;
+    DWORD window_start;
+    DWORD banned_until;
+} IpRateInfo;
+
+
+static IpRateInfo g_ipTable[MAX_IP_TRACK];
+static CRITICAL_SECTION g_ipLock;
+
+
 // STOP 기능용 전역 변수 (이 파일 안에서만 사용)
 static volatile int g_serverStopRequested = 0;
 static SOCKET       g_serverSocket = INVALID_SOCKET;
@@ -45,6 +64,58 @@ typedef struct {
     SOCKET client_sock;
     char client_ip[32];
 } ThreadArgs;
+
+static void log_printf(const char* fmt, ...);
+
+
+static int check_ip_rate_limit(const char* ip) {
+    DWORD now = GetTickCount();
+
+    EnterCriticalSection(&g_ipLock);
+
+    for (int i = 0; i < MAX_IP_TRACK; i++) {
+        IpRateInfo* e = &g_ipTable[i];
+
+        if (e->ip[0] == '\0') {
+            strcpy(e->ip, ip);
+            e->request_count = 1;
+            e->window_start = now;
+            e->banned_until = 0;
+            LeaveCriticalSection(&g_ipLock);
+            return 1;
+        }
+
+        if (strcmp(e->ip, ip) == 0) {
+
+            if (e->banned_until > now) {
+                LeaveCriticalSection(&g_ipLock);
+                return 0;
+            }
+
+            if (now - e->window_start > RATE_WINDOW_MS) {
+                e->window_start = now;
+                e->request_count = 1;
+                LeaveCriticalSection(&g_ipLock);
+                return 1;
+            }
+
+            e->request_count++;
+            if (e->request_count > RATE_MAX_REQ) {
+                e->banned_until = now + BAN_TIME_MS;
+                log_printf("[SECURITY] IP 차단: %s\n", ip);
+                LeaveCriticalSection(&g_ipLock);
+                return 0;
+            }
+
+            LeaveCriticalSection(&g_ipLock);
+            return 1;
+        }
+    }
+
+    LeaveCriticalSection(&g_ipLock);
+    return 1;
+}
+
 
 // --- 로그 콜백 포인터 ---
 static HttpLogCallback g_log_cb = NULL;
@@ -637,6 +708,16 @@ unsigned __stdcall handle_client(void* ptr) {
 
     log_printf("[CLIENT] %s 연결\n", ip);
 
+    // 🔐 IP 과다 요청 차단
+    if (!check_ip_rate_limit(ip)) {
+        log_printf("[SECURITY] 요청 차단됨: %s\n", ip);
+        closesocket(client);
+        _endthreadex(0);
+        return 0;
+    }
+
+
+
     char buf[MAX_REQ_SIZE];
     int len = recv(client, buf, MAX_REQ_SIZE - 1, 0);
 
@@ -696,6 +777,8 @@ int run_http_server(int port)
         log_printf("[ERROR] WSAStartup 실패\n");
         return -1;
     }
+    InitializeCriticalSection(&g_ipLock);
+    memset(g_ipTable, 0, sizeof(g_ipTable));
 
     SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
     if (server == INVALID_SOCKET) {
@@ -768,6 +851,8 @@ int run_http_server(int port)
 
     g_serverSocket = INVALID_SOCKET;
     WSACleanup();
+
+
 
     log_printf("[INFO] 서버 종료됨.\n");
     return 0;
