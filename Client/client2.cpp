@@ -65,17 +65,21 @@ ComPtr<ICoreWebView2Controller> webview_controller; // 컨트롤러 객체. 스마트 포�
 ComPtr<ICoreWebView2> webview;                           // 뷰 객체
 
 // 현재 보고 있는 페이지의 주소를 기억하는 변수 (기본값: /index.html)
-std::string g_current_uri = "/board.html";
+std::string g_current_uri = "/index.html";
+
+// 네비게이션에 쓰이는 스택(가변배열 vector 사용)
+std::vector<std::string> g_back_history;
+std::vector<std::string> g_forward_history;
 
 // 쿠키 저장소
 std::string g_cookie_storage = "";
 
 // --- 함수 원형 선언 ---
-std::string request_HTML(HWND hDlg, const char* server_ip, const char* method, const char* uri, const char* post_data);
+std::string request_HTML(HWND hDlg, const char* server_ip, int port, const char* method, const char* uri, const char* post_data);
 std::wstring string_to_wstring(const std::string& s);
 std::string utf8_to_ansi(const std::string& utf8);
 std::string url_decode(const std::string& raw);
-void StartRequestThread(HWND hDlg, const char* method, const char* uri, const char* body);
+void StartRequestThread(HWND hDlg, const char* method, const char* uri, const char* body, bool is_navigating = false);
 void Log(HWND hDlg, const char* fmt, ...);
 
 // 작업 스레드 파라미터 구조체
@@ -84,6 +88,7 @@ struct ThreadParam {
     char method[10] = { 0 };     // 메서드(GET, POST) 유형
     char uri[256] = { 0 };          // 요청 경로
     char ip[32] = { 0 };            // 서버 IP 주소
+    int port = 8080;            // 서버 PORT
     std::string body;               // POST 데이터 본문
     HWND hDlg = NULL;        // 메인 다이얼로그 핸들(로그 출력용)
 };
@@ -127,7 +132,7 @@ unsigned __stdcall RequestThreadFunc(void* arg) {
     ThreadParam* param = (ThreadParam*)arg;
 
     // 소켓 통신 수행
-    std::string html = request_HTML(param-> hDlg, param->ip, param->method, param->uri, param->body.c_str());
+    std::string html = request_HTML(param->hDlg, param->ip, param->port, param->method, param->uri, param->body.c_str());
 
     // 자동 리다이렉트: 글쓰기 요청이었다면 n초후 자동 리다이렉션
     if (strcmp(param->method, "POST") == 0) {
@@ -157,13 +162,24 @@ unsigned __stdcall RequestThreadFunc(void* arg) {
 }
 
 // 스레드 시작 및 현재 상태 동기화 헬퍼 함수
-void StartRequestThread(HWND hDlg, const char* method, const char* uri, const char* body) {
+void StartRequestThread(HWND hDlg, const char* method, const char* uri, const char* body, bool is_navigating) {
+
+    // 일반적인 페이지 이동
     // 현재 주소 변수(g_current_uri): 마지막 주소 저장
-    // 글쓰기 요청인 경우에는 갱신하지 않음: 페이지 리다이렉션이 아닌 단순 html 문서만 수신하기 때문
-    // !! 현재 수준에서는 서버 파일 시스템 내부의 하위 파일에 접근 불가 !!
-    if (uri != NULL && strcmp(method, "POST") != 0) {
+    // 글쓰기 요청인 경우에는 갱신하지 않음: 페이지 리다이렉션이 아닌 단순 html 문서만 수신하니까
+    if (!is_navigating && uri != NULL && strcmp(method, "POST") != 0) {
+
+        // 현재 페이지가 있고, 이동하려는 페이지와 다르다면 '뒤로가기 목록'에 저장
+        if (!g_current_uri.empty() && g_current_uri != uri) {
+            g_back_history.push_back(g_current_uri); // [수정] push_back 사용
+        }
+
+        // 새로운 길로 가는 것이므로 '앞으로 가기' 목록은 싹 비움
+        g_forward_history.clear(); // [수정] clear 사용
+
         g_current_uri = uri;
     }
+
 
     // URL 입력창 텍스트 갱신
     std::wstring w_uri = string_to_wstring(g_current_uri);
@@ -175,7 +191,11 @@ void StartRequestThread(HWND hDlg, const char* method, const char* uri, const ch
     strncpy(param->uri, uri, 255);
     if (body) param->body = body;
 
+    // 다이얼로그
     param->hDlg = hDlg;
+    // 포트 번호(없으면 기본값)
+    param->port = GetDlgItemInt(hDlg, IDC_EDIT_PORT, NULL, FALSE);
+    if (param->port == 0) param->port = 8080;
 
     // IP 주소 가져오기
     GetDlgItemTextA(hDlg, IDC_EDIT_IP, param->ip, 31);
@@ -216,11 +236,11 @@ void Log(HWND hDlg, const char* fmt, ...) {
 * > 반환값: HTML Body(문자열 형태)
 * - 소켓을 생성하여 HTTP 프로토콜을 준수하는 패킷을 제작하여 서버와 송/수신
 */
-std::string request_HTML(HWND hDlg, const char* server_ip, const char* method, const char* uri, const char* post_data) {
+std::string request_HTML(HWND hDlg, const char* server_ip, int port, const char* method, const char* uri, const char* post_data) {
     WSADATA wsaData;
     SOCKET client_sock;
     SOCKADDR_IN server_addr;
-    int port = 8080;
+    int server_port = port;
 
     Log(hDlg, "[SYSTEM] 소켓 초기화중...");
 
@@ -229,7 +249,7 @@ std::string request_HTML(HWND hDlg, const char* server_ip, const char* method, c
         Log(hDlg, "[ERROR] WSAStartup() 실패");
         return "Error: WSAStartup Failed";
     }
-    
+
     // 소켓 생성
     client_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (client_sock == INVALID_SOCKET) {
@@ -244,9 +264,9 @@ std::string request_HTML(HWND hDlg, const char* server_ip, const char* method, c
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
-    server_addr.sin_port = htons(port);
+    server_addr.sin_port = htons(server_port);
 
-    Log(hDlg, "[NETWORK] 서버(%s: %d) 연결 시도...", server_ip, port);
+    Log(hDlg, "[NETWORK] 서버(%s: %d) 연결 시도...", server_ip, server_port);
 
     // 연결 요청
     if (connect(client_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
@@ -431,57 +451,57 @@ std::string utf8_to_ansi(const std::string& utf8) {
 INT_PTR CALLBACK DlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         // 초기화
-        case WM_INITDIALOG: {
-            // 초기 UI 설정
-            // g_current_uri에 저장된 주소를 uri 입력창에 삽입
-            std::wstring w_start_uri = string_to_wstring(g_current_uri);
-            SetDlgItemText(hDlg, IDC_EDIT_URI, w_start_uri.c_str());
+    case WM_INITDIALOG: {
+        // 초기 UI 설정
+        // g_current_uri에 저장된 주소를 uri 입력창에 삽입
+        std::wstring w_start_uri = string_to_wstring(g_current_uri);
+        SetDlgItemText(hDlg, IDC_EDIT_URI, w_start_uri.c_str());
 
-            // ip 주소 기본값 설정
-            SetDlgItemText(hDlg, IDC_EDIT_IP, L"127.0.0.1");
+        // ip 주소 기본값 설정
+        SetDlgItemText(hDlg, IDC_EDIT_IP, L"127.0.0.1");
 
-            // 쿠키 불러오기(쿠키값은 전역변수(g_cookie_storage)에 저장됨)
-            LoadCookieFromFile();
+        // 쿠키 불러오기(쿠키값은 전역변수(g_cookie_storage)에 저장됨)
+        LoadCookieFromFile();
 
-            // WebView2 환경 생성(비동기 Callback 방식)
-            // 브라우저 엔진 작동
-            HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, nullptr, nullptr,
-                Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-                    [hDlg](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
-                        // 엔진 작동 완료
-                        if (FAILED(result) || env == nullptr) {
-                            MessageBox(hDlg, L"WebView2 Init Failed", L"Error", MB_ICONERROR);
-                            return result;
-                        }
+        // WebView2 환경 생성(비동기 Callback 방식)
+        // 브라우저 엔진 작동
+        HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, nullptr, nullptr,
+            Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+                [hDlg](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                    // 엔진 작동 완료
+                    if (FAILED(result) || env == nullptr) {
+                        MessageBox(hDlg, L"WebView2 Init Failed", L"Error", MB_ICONERROR);
+                        return result;
+                    }
 
-                        // WebView 컨트롤러 생성
-                        env->CreateCoreWebView2Controller(hDlg,
-                            Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                                [hDlg](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
-                                    // 컨트롤러 생성 확인
-                                    if (FAILED(result) || controller == nullptr) return result;
+                    // WebView 컨트롤러 생성
+                    env->CreateCoreWebView2Controller(hDlg,
+                        Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                            [hDlg](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
+                                // 컨트롤러 생성 확인
+                                if (FAILED(result) || controller == nullptr) return result;
 
-                                    webview_controller = controller;
-                                    // 컨트롤러에게 WebView 화면 객체를 요청
-                                    webview_controller->get_CoreWebView2(&webview);
+                                webview_controller = controller;
+                                // 컨트롤러에게 WebView 화면 객체를 요청
+                                webview_controller->get_CoreWebView2(&webview);
 
-                                    // WebView 영역 크기 조정 및 표시
-                                    HWND h_group = GetDlgItem(hDlg, IDC_STATIC_VIEW);
-                                    if (h_group) {
-                                        // 그룹 박스 크기에 맞춰서 창 크기 조절
-                                        RECT bounds;
-                                        GetWindowRect(h_group, &bounds);
-                                        MapWindowPoints(NULL, hDlg, (LPPOINT)&bounds, 2);
-                                        bounds.top += 15; bounds.left += 5;
-                                        bounds.right -= 5; bounds.bottom -= 5;
-                                        webview_controller->put_Bounds(bounds);
-                                        SetWindowPos(h_group, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-                                        // 화면에 보이기
-                                        webview_controller->put_IsVisible(TRUE);
+                                // WebView 영역 크기 조정 및 표시
+                                HWND h_group = GetDlgItem(hDlg, IDC_STATIC_VIEW);
+                                if (h_group) {
+                                    // 그룹 박스 크기에 맞춰서 창 크기 조절
+                                    RECT bounds;
+                                    GetWindowRect(h_group, &bounds);
+                                    MapWindowPoints(NULL, hDlg, (LPPOINT)&bounds, 2);
+                                    bounds.top += 15; bounds.left += 5;
+                                    bounds.right -= 5; bounds.bottom -= 5;
+                                    webview_controller->put_Bounds(bounds);
+                                    SetWindowPos(h_group, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                                    // 화면에 보이기
+                                    webview_controller->put_IsVisible(TRUE);
 
-                                        // HTML 문서에 JS 스크립트 주입 및 강제 실행
-                                        // - 순수 HTML 문서를 감시하면서 a태그 클릭, form 제출 이벤트를 하이재킹 & 가져온 데이터를 클라이언트 프로그램에서 처리
-                                        std::wstring injection_script = LR"(
+                                    // HTML 문서에 JS 스크립트 주입 및 강제 실행
+                                    // - 순수 HTML 문서를 감시하면서 a태그 클릭, form 제출 이벤트를 하이재킹 & 가져온 데이터를 클라이언트 프로그램에서 처리
+                                    std::wstring injection_script = LR"(
                                             // 페이지 로드 완료 시 생성
                                             document.addEventListener('DOMContentLoaded', () => {
 
@@ -522,158 +542,259 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) 
                                             });
                                         )";
 
-                                        // 모든 페이지 로딩 이후 직전에 생성한 인젝션 스크립트를 자동 실행될 수 있도록 등록
-                                        webview->AddScriptToExecuteOnDocumentCreated(injection_script.c_str(), nullptr);
-                                    }
+                                    // 모든 페이지 로딩 이후 직전에 생성한 인젝션 스크립트를 자동 실행될 수 있도록 등록
+                                    webview->AddScriptToExecuteOnDocumentCreated(injection_script.c_str(), nullptr);
+                                }
 
-                                    // JS -> C++ 통신
-                                    // window.chrome.webview.postMessage()를 통해 보낸 데이터를 여기서 수신함(= 페이지에서 postMessage() 사용시 호출)
-                                    EventRegistrationToken token;
-                                    webview->add_WebMessageReceived(
-                                        Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                            [hDlg](ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args)->HRESULT {
-                                                // 메시지 수신 시 실행 로직들
-                                                LPWSTR message_w;
-                                                args->TryGetWebMessageAsString(&message_w);
+                                // JS -> C++ 통신
+                                // window.chrome.webview.postMessage()를 통해 보낸 데이터를 여기서 수신함(= 페이지에서 postMessage() 사용시 호출)
+                                EventRegistrationToken token;
+                                webview->add_WebMessageReceived(
+                                    Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                        [hDlg](ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args)->HRESULT {
+                                            // 메시지 수신 시 실행 로직들
+                                            LPWSTR message_w;
+                                            args->TryGetWebMessageAsString(&message_w);
 
-                                                if (message_w) {
-                                                    // 유니코드 -> std::string 변환
-                                                    char message_c[MAX_REQ_SIZE];
-                                                    WideCharToMultiByte(CP_UTF8, 0, message_w, -1, message_c, MAX_REQ_SIZE, NULL, NULL);
-                                                    std::string msg = message_c;
+                                            if (message_w) {
+                                                // 유니코드 -> std::string 변환
+                                                char message_c[MAX_REQ_SIZE];
+                                                WideCharToMultiByte(CP_UTF8, 0, message_w, -1, message_c, MAX_REQ_SIZE, NULL, NULL);
+                                                std::string msg = message_c;
 
-                                                    // 프로토콜(METHOD:URI:DATA) 파싱
-                                                    std::string method, uri, data = "";
-                                                    size_t first_colon = msg.find(':');
+                                                // 프로토콜(METHOD:URI:DATA) 파싱
+                                                std::string method, uri, data = "";
+                                                size_t first_colon = msg.find(':');
 
-                                                    if (first_colon != std::string::npos) {
-                                                        method = msg.substr(0, first_colon);
+                                                if (first_colon != std::string::npos) {
+                                                    method = msg.substr(0, first_colon);
 
-                                                        if (method == "POST") {
-                                                            size_t second_colon = msg.find(':', first_colon + 1);
+                                                    if (method == "POST") {
+                                                        size_t second_colon = msg.find(':', first_colon + 1);
 
-                                                            if (second_colon != std::string::npos) {
-                                                                uri = msg.substr(first_colon + 1, second_colon - (first_colon + 1));
-                                                                std::string raw_encoded_data = msg.substr(second_colon + 1);
+                                                        if (second_colon != std::string::npos) {
+                                                            uri = msg.substr(first_colon + 1, second_colon - (first_colon + 1));
+                                                            std::string raw_encoded_data = msg.substr(second_colon + 1);
 
-                                                                // 데이터 흐름: URL Decode -> UTF-8 데이터 ANSI로 변환 -> Server send()
-                                                                // 받은 문자열 디코딩
-                                                                std::string decoded_utf8 = url_decode(raw_encoded_data);
-                                                                // UTF-8 -> ANSI 변환 후 "저장"
-                                                                data = utf8_to_ansi(decoded_utf8);
-                                                            }
+                                                            // 데이터 흐름: URL Decode -> UTF-8 데이터 ANSI로 변환 -> Server send()
+                                                            // 받은 문자열 디코딩
+                                                            std::string decoded_utf8 = url_decode(raw_encoded_data);
+                                                            // UTF-8 -> ANSI 변환 후 "저장"
+                                                            data = utf8_to_ansi(decoded_utf8);
                                                         }
-                                                        else {  // GET 방식
-                                                            uri = msg.substr(first_colon + 1);
-                                                        }
-
-                                                        // 링크 클릭 등의 이벤트로 이동할 때도 백그라운드 스레드 시작
-                                                        // (내부에서 주소창 업데이트 + g_current_uri 갱신 자동 수행)
-                                                        StartRequestThread(hDlg, method.c_str(), uri.c_str(), data.c_str());
                                                     }
-                                                    CoTaskMemFree(message_w);
+                                                    else {  // GET 방식
+                                                        uri = msg.substr(first_colon + 1);
+                                                    }
+
+                                                    // 링크 클릭 등의 이벤트로 이동할 때도 백그라운드 스레드 시작
+                                                    // (내부에서 주소창 업데이트 + g_current_uri 갱신 자동 수행)
+                                                    StartRequestThread(hDlg, method.c_str(), uri.c_str(), data.c_str());
                                                 }
-                                                return S_OK;
-                                            }).Get(), &token);
+                                                CoTaskMemFree(message_w);
+                                            }
+                                            return S_OK;
+                                        }).Get(), &token);
 
-                                    // 초기 화면 로딩
-                                    webview->NavigateToString(L"<h1>클라이언트 준비!</h1><p>연결 준비 완료.</p>");
-                                    return S_OK;
-                                }).Get());  // 컨트롤러 콜백 끝
-                        return S_OK;
-                    }).Get());  // 엔진 콜백 끝
+                                // 초기 화면 로딩
+                                webview->NavigateToString(L"<h1>클라이언트 준비!</h1><p>연결 준비 완료.</p>");
+                                return S_OK;
+                            }).Get());  // 컨트롤러 콜백 끝
+                    return S_OK;
+                }).Get());  // 엔진 콜백 끝
 
-            if (FAILED(hr)) {
-                MessageBox(hDlg, L"WebView2 초기화 실패", L"Error", MB_ICONERROR);
+        if (FAILED(hr)) {
+            MessageBox(hDlg, L"WebView2 초기화 실패", L"Error", MB_ICONERROR);
+        }
+        return (INT_PTR)TRUE;
+    }
+                      // 스레드에서 작업이 끝났을 경우 화면 갱신
+    case WM_UPDATE_WEBVIEW: {
+        std::string* received_html = (std::string*)lParam;
+
+        if (webview != nullptr && received_html != nullptr) {
+            // 수신된 HTML 문서를 화면에 출력할 때 사용되는 유니코드 형태로 변환
+            std::wstring converted_html = string_to_wstring(*received_html);
+            webview->NavigateToString(converted_html.c_str());
+        }
+
+        if (received_html) delete received_html;    // 메모리 해제
+
+        // 로딩 완료
+        SetWindowText(hDlg, L"클라이언트 - 준비"); // 제목 변경
+        SetCursor(LoadCursor(NULL, IDC_ARROW)); // 커서 복구
+        return (INT_PTR)TRUE;
+    }
+                          // 버튼 이벤트 처리
+    case WM_COMMAND: {
+        // GO 버튼: 입력창의 내용을 읽어서 이동
+        if (LOWORD(wParam) == IDC_BTN_GO) {
+            wchar_t w_uri[256];
+            GetDlgItemText(hDlg, IDC_EDIT_URI, w_uri, 256);
+
+            char c_uri[256];
+            WideCharToMultiByte(CP_UTF8, 0, w_uri, -1, c_uri, 256, NULL, NULL);
+
+            SetWindowText(hDlg, L"클라이언트 - 로딩중..."); // 제목 변경
+            SetCursor(LoadCursor(NULL, IDC_WAIT)); // 모래시계 커서
+
+            // 입력한 주소로 이동 (g_current_uri 갱신됨)
+            StartRequestThread(hDlg, "GET", c_uri, "");
+        }
+        // Refresh 버튼: 기억해둔 g_current_uri를 사용하여 다시 로드
+        else if (LOWORD(wParam) == IDC_BTN_REFRESH) {
+            // 입력창을 읽지 않고, 변수에 저장된 '현재 주소' 사용
+
+            SetWindowText(hDlg, L"클라이언트 - 로딩중..."); // 제목 변경
+            SetCursor(LoadCursor(NULL, IDC_WAIT)); // 모래시계 커서
+
+            StartRequestThread(hDlg, "GET", g_current_uri.c_str(), "");
+        }
+        // Cookie 버튼: 저장중인 쿠키 목록을 메시지박스로 보여줌
+        else if (LOWORD(wParam) == IDC_BTN_COOKIE) {
+            if (g_cookie_storage.empty()) {
+                MessageBox(hDlg, L"현재 저장된 쿠키가 없습니다.", L"Cookie Status", MB_ICONINFORMATION);
+            }
+            else {
+                std::wstring w_cookie = string_to_wstring(g_cookie_storage);
+                std::wstring msg = L"저장된 쿠키 값:\n\n" + w_cookie;
+                MessageBox(hDlg, msg.c_str(), L"Current Cookie", MB_ICONINFORMATION);
             }
             return (INT_PTR)TRUE;
         }
-        // 스레드에서 작업이 끝났을 경우 화면 갱신
-        case WM_UPDATE_WEBVIEW: {
-            std::string* received_html = (std::string*)lParam;
+        // 앞으로 가기
+        else if (LOWORD(wParam) == IDC_BTN_FORWARD) {
+            // 목록이 비어있지 않다면
+            if (!g_forward_history.empty()) {
+                // 현재 페이지를 '뒤로 가기' 목록에 넣음
+                g_back_history.push_back(g_current_uri);
 
-            if (webview != nullptr && received_html != nullptr) {
-                // 수신된 HTML 문서를 화면에 출력할 때 사용되는 유니코드 형태로 변환
-                std::wstring converted_html = string_to_wstring(*received_html);
-                webview->NavigateToString(converted_html.c_str());
+                // 앞으로 가기 목록의 가장 최근(맨 뒤) 값을 꺼냄
+                std::string next = g_forward_history.back(); // 값 확인
+                g_forward_history.pop_back();                // 값 삭제
+
+                // 현재 주소 갱신
+                g_current_uri = next;
+
+                // 이동
+                StartRequestThread(hDlg, "GET", next.c_str(), "", true);
             }
+        }
+        // 뒤로가기 버튼
+        else if (LOWORD(wParam) == IDC_BTN_BACK) {
+            // 목록이 비어있지 않다면 (!empty)
+            if (!g_back_history.empty()) {
+                // 현재 페이지를 '앞으로 가기' 목록에 넣음
+                g_forward_history.push_back(g_current_uri);
 
-            if (received_html) delete received_html;    // 메모리 해제
+                // 뒤로가기 목록의 가장 최근(맨 뒤) 값을 꺼냄
+                std::string prev = g_back_history.back(); // 값 확인
+                g_back_history.pop_back();                // 값 삭제(꺼내기)
 
-            // 로딩 완료
-            SetWindowText(hDlg, L"클라이언트 - 준비"); // 제목 변경
-            SetCursor(LoadCursor(NULL, IDC_ARROW)); // 커서 복구
+                // 현재 주소 갱신
+                g_current_uri = prev;
+
+                // 페이지 이동 is_navigating = true로 설정: 꼬임 방지
+                StartRequestThread(hDlg, "GET", prev.c_str(), "", true);
+            }
+        }
+        // 다이얼로그 종료
+        else if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(hDlg, 0);
             return (INT_PTR)TRUE;
         }
-        // 버튼 이벤트 처리
-        case WM_COMMAND: {
-            // GO 버튼: 입력창의 내용을 읽어서 이동
-            if (LOWORD(wParam) == IDC_BTN_GO) {
-                wchar_t w_uri[256];
-                GetDlgItemText(hDlg, IDC_EDIT_URI, w_uri, 256);
+        break;
+    }
+                   // 클라이언트 창 크기 조절
+    case WM_SIZE: {
+        RECT bounds;
+        GetClientRect(hDlg, &bounds);    // 다이얼로그 전체 내부 크기
 
-                char c_uri[256];
-                WideCharToMultiByte(CP_UTF8, 0, w_uri, -1, c_uri, 256, NULL, NULL);
+        const int TOP_UI_HEIGHT = 50;    // 상단 네비게이션 바 높이
+        const int LOG_AREA_HEIGHT = 120; // 하단 로그 영역 전체 높이
 
-                SetWindowText(hDlg, L"클라이언트 - 로딩중..."); // 제목 변경
-                SetCursor(LoadCursor(NULL, IDC_WAIT)); // 모래시계 커서
+        // 1. 그룹박스(테두리) 위치 계산
+        RECT rcGroup;
+        rcGroup.left = 10;
+        rcGroup.top = TOP_UI_HEIGHT;
+        rcGroup.right = bounds.right - 10;
+        rcGroup.bottom = bounds.bottom - LOG_AREA_HEIGHT;
 
-                // 입력한 주소로 이동 (g_current_uri 갱신됨)
-                StartRequestThread(hDlg, "GET", c_uri, "");
-            }
-            // Refresh 버튼: 기억해둔 g_current_uri를 사용하여 다시 로드
-            else if (LOWORD(wParam) == IDC_BTN_REFRESH) {
-                // 입력창을 읽지 않고, 변수에 저장된 '현재 주소' 사용
-
-                SetWindowText(hDlg, L"클라이언트 - 로딩중..."); // 제목 변경
-                SetCursor(LoadCursor(NULL, IDC_WAIT)); // 모래시계 커서
-
-                StartRequestThread(hDlg, "GET", g_current_uri.c_str(), "");
-            }
-            // Cookie 버튼: 저장중인 쿠키 목록을 메시지박스로 보여줌
-            else if (LOWORD(wParam) == IDC_BTN_COOKIE) {
-                if (g_cookie_storage.empty()) {
-                    MessageBox(hDlg, L"현재 저장된 쿠키가 없습니다.", L"Cookie Status", MB_ICONINFORMATION);
-                }
-                else {
-                    std::wstring w_cookie = string_to_wstring(g_cookie_storage);
-                    std::wstring msg = L"저장된 쿠키 값:\n\n" + w_cookie;
-                    MessageBox(hDlg, msg.c_str(), L"Current Cookie", MB_ICONINFORMATION);
-                }
-                return (INT_PTR)TRUE;
-            }
-            // 다이얼로그 종료
-            else if (LOWORD(wParam) == IDCANCEL) {
-                EndDialog(hDlg, 0);
-                return (INT_PTR)TRUE;
-            }
-            break;
+        // 그룹박스 이동
+        HWND hGroup = GetDlgItem(hDlg, IDC_STATIC_VIEW);
+        if (hGroup) {
+            SetWindowPos(hGroup, NULL,
+                rcGroup.left, rcGroup.top,
+                rcGroup.right - rcGroup.left, rcGroup.bottom - rcGroup.top,
+                SWP_NOZORDER);
         }
-        // 프로그램 종료
-        case WM_DESTROY: {
-            SaveCookieToFile(); // 쿠키 저장
-            break;
+
+        // 그룹박스 안쪽으로 패딩 적용
+        if (webview_controller != nullptr) {
+            RECT rcWeb = rcGroup;
+            rcWeb.top += 15;    // 제목 공간 확보
+            rcWeb.left += 5;
+            rcWeb.right -= 5;
+            rcWeb.bottom -= 5;
+            webview_controller->put_Bounds(rcWeb);
         }
-        // 로그 출력 메시지 처리
-        case WM_APP_LOG: {
-            char* msg = (char*)lParam;
 
-            if (msg) {
-                // 리스트박스 핸들 가져오기
-                HWND hList = GetDlgItem(hDlg, IDC_LIST_LOG);
+        // 하단 로그 영역 계산
+        // 리스트박스 위치
+        int listTop = bounds.bottom - LOG_AREA_HEIGHT + 15; // 라벨 높이(15)만큼 띄움
+        int listHeight = LOG_AREA_HEIGHT - 25;              // 하단 여백(10) 확보
 
-                // 문자열 변환
-                std::wstring wmsg = string_to_wstring(msg);
-                SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)wmsg.c_str());
-
-                // 스크롤을 맨 아래로 이동시킴(자동스크롤)
-                int count = (int)SendMessage(hList, LB_GETCOUNT, 0, 0);
-                SendMessage(hList, LB_SETCURSEL, count - 1, 0);
-                SendMessage(hList, LB_SETCURSEL, -1, 0);
-
-                delete[] msg;   // 메모리 할당 제거
-            }
+        // 로그 라벨 이동 ("System Log:")
+        HWND hLogLabel = GetDlgItem(hDlg, IDC_STATIC_LOG);
+        if (hLogLabel) {
+            // 리스트박스 바로 위에 위치시킴
+            SetWindowPos(hLogLabel, NULL,
+                10, listTop - 15, // 리스트박스보다 15픽셀 위
+                100, 15,          // 너비 100, 높이 15
+                SWP_NOZORDER);
         }
+
+        // 리스트박스 이동
+        HWND hList = GetDlgItem(hDlg, IDC_LIST_LOG);
+        if (hList) {
+            SetWindowPos(hList, NULL,
+                10, listTop,
+                bounds.right - 20, listHeight,
+                SWP_NOZORDER);
+        }
+
+        // 화면 강제 다시 그리기 (깨짐 현상 해결)
+        // WebView 주변의 잔상을 지우기 위해 다이얼로그 전체를 다시 그리도록 요청
+        // TRUE: 배경색도 다시 칠함 (잔상 제거)
+        InvalidateRect(hDlg, NULL, TRUE);
+
+        return (INT_PTR)TRUE;
+    }
+                // 프로그램 종료
+    case WM_DESTROY: {
+        SaveCookieToFile(); // 쿠키 저장
+        break;
+    }
+                   // 로그 출력 메시지 처리
+    case WM_APP_LOG: {
+        char* msg = (char*)lParam;
+
+        if (msg) {
+            // 리스트박스 핸들 가져오기
+            HWND hList = GetDlgItem(hDlg, IDC_LIST_LOG);
+
+            // 문자열 변환
+            std::wstring wmsg = string_to_wstring(msg);
+            SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)wmsg.c_str());
+
+            // 스크롤을 맨 아래로 이동시킴(자동스크롤)
+            int count = (int)SendMessage(hList, LB_GETCOUNT, 0, 0);
+            SendMessage(hList, LB_SETCURSEL, count - 1, 0);
+            SendMessage(hList, LB_SETCURSEL, -1, 0);
+
+            delete[] msg;   // 메모리 할당 제거
+        }
+    }
     }
     return (INT_PTR)FALSE;
 }
