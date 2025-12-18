@@ -11,5 +11,9 @@
 #define IDC_BTN_COOKIE		1005	// 쿠키 확인 버튼
 #define IDC_LIST_LOG			1006	// 로그 리스트박스
 #define IDC_EDIT_IP				1007	// IP 주소 입력창
+#define IDC_EDIT_PORT           1008	// PORT 입력창
+#define IDC_BTN_BACK            1009	// 네비게이션 백버튼
+#define IDC_BTN_FORWARD         1010	// 네비게이션 포워드버튼
+#define IDC_STATIC_LOG			1011	// 로그 태그
 
 #endif // !RESOURCE_H
