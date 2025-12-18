@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include <ctype.h>      // isxdigit
+#include <ctype.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -38,6 +38,7 @@ typedef struct {
     const char* mime_type;
     char* content;
     long content_size;
+    int owns_content; // ✅ free 해야 하면 1, 아니면 0
 } HttpResponse;
 
 typedef struct {
@@ -91,7 +92,7 @@ char* read_file(const char* path, long* out_size) {
     }
 
     long size = ftell(fp);
-    if (size <= 0) {
+    if (size < 0) {
         fclose(fp);
         return NULL;
     }
@@ -131,7 +132,6 @@ const char* get_mime_type(const char* file) {
 }
 
 // ---------- URL 디코더 (in-place) ----------
-// application/x-www-form-urlencoded용: '+' -> ' ', "%xx" -> 바이트
 static void url_decode_inplace(char* s) {
     if (!s) return;
 
@@ -156,7 +156,6 @@ static void url_decode_inplace(char* s) {
 }
 
 // ---------- x-www-form-urlencoded 파싱 ----------
-// body 예: "nickname=우정&content=안녕테스트"
 static void parse_form_body(
     const char* body,
     char* outNickname, size_t nickSize,
@@ -164,7 +163,7 @@ static void parse_form_body(
 ) {
     if (!outNickname || !outContent) return;
 
-    if (nickSize > 0)   outNickname[0] = '\0';
+    if (nickSize > 0) outNickname[0] = '\0';
     if (contentSize > 0) outContent[0] = '\0';
 
     if (!body) return;
@@ -186,22 +185,24 @@ static void parse_form_body(
             url_decode_inplace(val);
 
             if (strcmp(key, "nickname") == 0) {
-                strncpy(outNickname, val, nickSize - 1);
-                outNickname[nickSize - 1] = '\0';
+                if (nickSize > 0) {
+                    strncpy(outNickname, val, nickSize - 1);
+                    outNickname[nickSize - 1] = '\0';
+                }
             }
             else if (strcmp(key, "content") == 0) {
-                strncpy(outContent, val, contentSize - 1);
-                outContent[contentSize - 1] = '\0';
+                if (contentSize > 0) {
+                    strncpy(outContent, val, contentSize - 1);
+                    outContent[contentSize - 1] = '\0';
+                }
             }
         }
-
         token = strtok_s(NULL, "&", &context);
     }
 
     free(temp);
 
-    // 닉네임이 비어 있으면 기본값
-    if (outNickname[0] == '\0' && nickSize > 0) {
+    if (nickSize > 0 && outNickname[0] == '\0') {
         strncpy(outNickname, "anonymous", nickSize - 1);
         outNickname[nickSize - 1] = '\0';
     }
@@ -246,9 +247,257 @@ void parse_request(const char* raw, HttpRequest* req) {
     }
 }
 
+/* =========================
+   ✅ board.html 동적 생성용 유틸
+   ========================= */
+
+static void sb_ensure(char** s, size_t* cap, size_t need) {
+    if (*cap >= need) return;
+    size_t ncap = (*cap == 0) ? 4096 : *cap;
+    while (ncap < need) ncap *= 2;
+    char* p = (char*)realloc(*s, ncap);
+    if (!p) return;
+    *s = p;
+    *cap = ncap;
+}
+
+static void sb_append(char** s, size_t* cap, size_t* len, const char* text) {
+    if (!text) return;
+    size_t add = strlen(text);
+    size_t need = (*len) + add + 1;
+    sb_ensure(s, cap, need);
+    if (!*s) return;
+    memcpy((*s) + (*len), text, add);
+    *len += add;
+    (*s)[*len] = '\0';
+}
+
+static void sb_appendf(char** s, size_t* cap, size_t* len, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+
+    char tmp[2048];
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+
+    va_end(ap);
+
+    if (n <= 0) return;
+    tmp[sizeof(tmp) - 1] = '\0';
+    sb_append(s, cap, len, tmp);
+}
+
+// HTML escape (& < > " ')
+static char* html_escape_dup(const char* in) {
+    if (!in) return _strdup("");
+    size_t n = 0;
+    for (const unsigned char* p = (const unsigned char*)in; *p; ++p) {
+        switch (*p) {
+        case '&': n += 5; break;   // &amp;
+        case '<': n += 4; break;   // &lt;
+        case '>': n += 4; break;   // &gt;
+        case '"': n += 6; break;   // &quot;
+        case '\'': n += 5; break;  // &#39;
+        default: n += 1; break;
+        }
+    }
+    char* out = (char*)malloc(n + 1);
+    if (!out) return _strdup("");
+    char* d = out;
+    for (const unsigned char* p = (const unsigned char*)in; *p; ++p) {
+        switch (*p) {
+        case '&': memcpy(d, "&amp;", 5); d += 5; break;
+        case '<': memcpy(d, "&lt;", 4); d += 4; break;
+        case '>': memcpy(d, "&gt;", 4); d += 4; break;
+        case '"': memcpy(d, "&quot;", 6); d += 6; break;
+        case '\'': memcpy(d, "&#39;", 5); d += 5; break;
+        default: *d++ = (char)*p; break;
+        }
+    }
+    *d = '\0';
+    return out;
+}
+
+// posts\post_*.txt 파일 1개 파싱: nickname, content
+static void parse_post_file(const char* path, char* outNick, size_t nickSz, char** outContentDyn) {
+    if (nickSz > 0) outNick[0] = '\0';
+    if (outContentDyn) *outContentDyn = NULL;
+
+    long sz = 0;
+    char* raw = read_file(path, &sz);
+    if (!raw) return;
+
+    // nickname=... \r\n
+    char* nickPos = strstr(raw, "nickname=");
+    if (nickPos) {
+        nickPos += 9;
+        char* eol = strstr(nickPos, "\r\n");
+        size_t nlen = eol ? (size_t)(eol - nickPos) : strlen(nickPos);
+        if (nlen >= nickSz) nlen = nickSz - 1;
+        if (nickSz > 0) {
+            memcpy(outNick, nickPos, nlen);
+            outNick[nlen] = '\0';
+        }
+    }
+
+    // content=... (이후는 파일 끝까지 content로 간주)
+    char* contPos = strstr(raw, "content=");
+    if (contPos) {
+        contPos += 8;
+        // 뒤쪽 불필요한 마지막 개행 정리
+        size_t clen = strlen(contPos);
+        while (clen > 0 && (contPos[clen - 1] == '\n' || contPos[clen - 1] == '\r')) {
+            contPos[clen - 1] = '\0';
+            clen--;
+        }
+        if (outContentDyn) *outContentDyn = _strdup(contPos);
+    }
+    else {
+        if (outContentDyn) *outContentDyn = _strdup("");
+    }
+
+    if (nickSz > 0 && outNick[0] == '\0') {
+        strncpy(outNick, "anonymous", nickSz - 1);
+        outNick[nickSz - 1] = '\0';
+    }
+
+    free(raw);
+}
+
+// 파일명 정렬 (내림차순)
+static int __cdecl cmp_desc(const void* a, const void* b) {
+    const char* const* pa = (const char* const*)a;
+    const char* const* pb = (const char* const*)b;
+    return strcmp(*pb, *pa);
+}
+
+// GET /board.html 동적 페이지 생성
+static char* build_board_html(long* outSize) {
+    char postsDir[MAX_PATH];
+    _snprintf_s(postsDir, sizeof(postsDir), _TRUNCATE, "%s\\posts", WEB_ROOT);
+    CreateDirectoryA(postsDir, NULL);
+
+    // 파일 목록 수집
+    char pattern[MAX_PATH];
+    _snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%s\\post_*.txt", postsDir);
+
+    WIN32_FIND_DATAA ffd;
+    HANDLE hFind = FindFirstFileA(pattern, &ffd);
+
+    char** names = NULL;
+    size_t count = 0, cap = 0;
+
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                if (count + 1 > cap) {
+                    size_t ncap = (cap == 0) ? 32 : cap * 2;
+                    char** p = (char**)realloc(names, ncap * sizeof(char*));
+                    if (!p) break;
+                    names = p;
+                    cap = ncap;
+                }
+                names[count++] = _strdup(ffd.cFileName);
+            }
+        } while (FindNextFileA(hFind, &ffd));
+        FindClose(hFind);
+    }
+
+    if (count > 1) {
+        qsort(names, count, sizeof(char*), cmp_desc);
+    }
+
+    char* html = NULL;
+    size_t hcap = 0, hlen = 0;
+
+    sb_append(&html, &hcap, &hlen,
+        "<!doctype html>"
+        "<html><head><meta charset='utf-8'/>"
+        "<title>Board</title>"
+        "<style>"
+        "body{font-family:Arial, sans-serif; margin:20px;}"
+        ".wrap{max-width:900px; margin:0 auto;}"
+        ".post{border:1px solid #ddd; padding:12px; border-radius:8px; margin:10px 0;}"
+        ".meta{font-size:12px; color:#666; margin-bottom:8px;}"
+        "pre{white-space:pre-wrap; word-break:break-word; margin:0;}"
+        "input,textarea{width:100%; padding:8px; box-sizing:border-box;}"
+        "button{padding:10px 14px; cursor:pointer;}"
+        "</style>"
+        "</head><body><div class='wrap'>"
+        "<h1>게시판</h1>"
+        "<form method='POST' action='/post'>"
+        "<label>닉네임</label><input name='nickname' placeholder='닉네임'/>"
+        "<label style='display:block; margin-top:10px;'>내용</label>"
+        "<textarea name='content' rows='5' placeholder='내용을 입력하세요'></textarea>"
+        "<div style='margin-top:10px;'><button type='submit'>등록</button></div>"
+        "</form>"
+        "<hr/>"
+        "<h2>글 목록</h2>"
+    );
+
+    if (count == 0) {
+        sb_append(&html, &hcap, &hlen, "<p>아직 등록된 글이 없습니다.</p>");
+    }
+    else {
+        for (size_t i = 0; i < count; i++) {
+            char path[MAX_PATH];
+            _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", postsDir, names[i]);
+
+            char nick[128] = { 0 };
+            char* content = NULL;
+
+            parse_post_file(path, nick, sizeof(nick), &content);
+
+            char* nickEsc = html_escape_dup(nick);
+            char* contEsc = html_escape_dup(content ? content : "");
+
+            sb_appendf(&html, &hcap, &hlen,
+                "<div class='post'>"
+                "<div class='meta'><b>%s</b> <span style='margin-left:10px;'>(%s)</span></div>"
+                "<pre>%s</pre>"
+                "</div>",
+                nickEsc, names[i], contEsc
+            );
+
+            free(nickEsc);
+            free(contEsc);
+            if (content) free(content);
+        }
+    }
+
+    sb_append(&html, &hcap, &hlen, "</div></body></html>");
+
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+
+    if (outSize) *outSize = (long)hlen;
+    return html ? html : _strdup("<html><body><h1>Board Error</h1></body></html>");
+}
+
 // ----------- 요청 처리 ----------
-// 여기서 POST /post 저장 + 기존 GET 정적파일 처리
 void handle_request(const HttpRequest* req, HttpResponse* res) {
+    if (!req || !res) return;
+
+    // 기본값
+    res->status_code = 500;
+    res->status_text = "Internal Server Error";
+    res->mime_type = "text/html";
+    res->content = NULL;
+    res->content_size = 0;
+    res->owns_content = 0;
+
+    // ✅ 0) GET /board.html : 동적 게시판(저장된 txt들을 HTML로 렌더)
+    if (strcmp(req->method, "GET") == 0 && strcmp(req->uri, "/board.html") == 0) {
+        long size = 0;
+        char* page = build_board_html(&size);
+        res->status_code = 200;
+        res->status_text = "OK";
+        res->mime_type = "text/html";
+        res->content = page;
+        res->content_size = size;
+        res->owns_content = 1;
+        return;
+    }
+
     // 1) POST /post : 글 저장 처리
     if (strcmp(req->method, "POST") == 0 && strcmp(req->uri, "/post") == 0) {
 
@@ -264,10 +513,8 @@ void handle_request(const HttpRequest* req, HttpResponse* res) {
         char postsDir[MAX_PATH];
         _snprintf_s(postsDir, sizeof(postsDir), _TRUNCATE, "%s\\posts", WEB_ROOT);
 
-        // 폴더 생성 (이미 있으면 실패해도 상관없음)
         CreateDirectoryA(postsDir, NULL);
 
-        // 파일 이름: post_YYYYMMDD_HHMMSS_ID.txt
         SYSTEMTIME st;
         GetLocalTime(&st);
 
@@ -286,54 +533,48 @@ void handle_request(const HttpRequest* req, HttpResponse* res) {
         FILE* fp = fopen(filePath, "wb");
         if (!fp) {
             const char* msg = "<html><body><h1>500 Internal Server Error</h1><p>글 저장 실패</p></body></html>";
+            char* dyn = (char*)malloc(strlen(msg) + 1);
+            if (dyn) { strcpy(dyn, msg); }
+
             res->status_code = 500;
             res->status_text = "Internal Server Error";
             res->mime_type = "text/html";
-            // malloc 실패해도 최소한 static 문자열은 살아있게
-            char* dyn = (char*)malloc(strlen(msg) + 1);
-            if (dyn) {
-                strcpy(dyn, msg);
-                res->content = dyn;
-            }
-            else {
-                res->content = (char*)msg; // 해제 대상 아님 (status_code 500이라 free 안 함)
-            }
-            res->content_size = (long)strlen(res->content);
+            res->content = dyn ? dyn : NULL;
+            res->content_size = dyn ? (long)strlen(dyn) : 0;
+            res->owns_content = dyn ? 1 : 0;
+
             log_printf("[ERROR] 글 파일 열기 실패: %s\n", filePath);
             return;
         }
 
-        // 파일에 저장 포맷 (나중에 읽기 쉽게 key=value 형태로 저장)
         fprintf(fp, "nickname=%s\r\n", nickname);
         fprintf(fp, "content=%s\r\n", content);
         fclose(fp);
 
         log_printf("[POST] 글 저장 완료: %s\n", filePath);
 
-        // 클라이언트에게 돌려줄 HTML 응답 본문 만들기
+        // 클라이언트에게 돌려줄 HTML 응답 본문 만들기 (기존 기능 유지)
         const char* tpl =
             "<html><body>"
             "<h1>글이 등록되었습니다.</h1>"
             "<p><b>닉네임:</b> %s</p>"
             "<p><b>내용:</b></p><pre>%s</pre>"
+            "<p style='color:#666;'>잠시 후 목록으로 이동합니다.</p>"
             "</body></html>";
 
-        size_t needSize = strlen(tpl) + strlen(nickname) + strlen(content) + 32;
+        size_t needSize = strlen(tpl) + strlen(nickname) + strlen(content) + 64;
         char* html = (char*)malloc(needSize);
         if (!html) {
             const char* msg = "<html><body><h1>등록 완료</h1><p>메모리 부족으로 내용 표시 불가</p></body></html>";
+            char* dyn = (char*)malloc(strlen(msg) + 1);
+            if (dyn) strcpy(dyn, msg);
+
             res->status_code = 200;
             res->status_text = "OK";
             res->mime_type = "text/html";
-            char* dyn = (char*)malloc(strlen(msg) + 1);
-            if (dyn) {
-                strcpy(dyn, msg);
-                res->content = dyn;
-            }
-            else {
-                res->content = (char*)msg; // 200인데 static이라 free하면 안되지만, 아래에서 status_code==200일 때만 free라 안전
-            }
-            res->content_size = (long)strlen(res->content);
+            res->content = dyn ? dyn : NULL;
+            res->content_size = dyn ? (long)strlen(dyn) : 0;
+            res->owns_content = dyn ? 1 : 0;
             return;
         }
 
@@ -343,36 +584,41 @@ void handle_request(const HttpRequest* req, HttpResponse* res) {
         res->mime_type = "text/html";
         res->content = html;
         res->content_size = (long)strlen(html);
+        res->owns_content = 1;
         return;
     }
 
     // 2) 그 외: 기존과 동일한 정적 파일 처리 (GET 등)
-    char fullpath[512];
+    {
+        char fullpath[512];
 
-    if (strcmp(req->uri, "/") == 0)
-        sprintf(fullpath, "%s\\index.html", WEB_ROOT);
-    else
-        sprintf(fullpath, "%s%s", WEB_ROOT, req->uri);
+        if (strcmp(req->uri, "/") == 0)
+            sprintf(fullpath, "%s\\index.html", WEB_ROOT);
+        else
+            sprintf(fullpath, "%s%s", WEB_ROOT, req->uri);
 
-    for (char* p = fullpath; *p; p++)
-        if (*p == '/') *p = '\\';
+        for (char* p = fullpath; *p; p++)
+            if (*p == '/') *p = '\\';
 
-    long size = 0;
-    char* buf = read_file(fullpath, &size);
+        long size = 0;
+        char* buf = read_file(fullpath, &size);
 
-    if (buf) {
-        res->status_code = 200;
-        res->status_text = "OK";
-        res->mime_type = get_mime_type(fullpath);
-        res->content = buf;
-        res->content_size = size;
-    }
-    else {
-        res->status_code = 404;
-        res->status_text = "Not Found";
-        res->mime_type = "text/html";
-        res->content = "<h1>404 Not Found</h1>";
-        res->content_size = (long)strlen(res->content);
+        if (buf) {
+            res->status_code = 200;
+            res->status_text = "OK";
+            res->mime_type = get_mime_type(fullpath);
+            res->content = buf;
+            res->content_size = size;
+            res->owns_content = 1;
+        }
+        else {
+            res->status_code = 404;
+            res->status_text = "Not Found";
+            res->mime_type = "text/html";
+            res->content = "<h1>404 Not Found</h1>";
+            res->content_size = (long)strlen(res->content);
+            res->owns_content = 0;
+        }
     }
 }
 
@@ -410,6 +656,7 @@ unsigned __stdcall handle_client(void* ptr) {
         req.query_string[0] ? req.query_string : "-");
 
     HttpResponse res;
+    memset(&res, 0, sizeof(res));
     handle_request(&req, &res);
 
     char header[512];
@@ -419,17 +666,18 @@ unsigned __stdcall handle_client(void* ptr) {
         "Content-Length: %ld\r\n"
         "Connection: close\r\n\r\n",
         res.status_code, res.status_text,
-        res.mime_type, res.content_size);
+        res.mime_type ? res.mime_type : "text/plain",
+        res.content_size);
 
     send(client, header, hlen, 0);
-    send(client, res.content, (int)res.content_size, 0);
 
-    // 200 OK 이면서 동적 메모리인 경우만 free
-    if (res.status_code == 200) {
-        // 정적 파일(read_file) or malloc(html) 둘 다 free 대상
-        if (res.content != NULL) {
-            free(res.content);
-        }
+    if (res.content && res.content_size > 0) {
+        send(client, res.content, (int)res.content_size, 0);
+    }
+
+    // ✅ 안전한 free (동적 할당된 것만)
+    if (res.owns_content && res.content) {
+        free(res.content);
     }
 
     closesocket(client);
